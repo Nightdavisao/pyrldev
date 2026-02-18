@@ -1,0 +1,357 @@
+# AGENTS.md — Codebase knowledge for AI agents
+
+This file documents everything an AI agent needs to know to work on this codebase
+without re-deriving it from scratch. Written by the LLM that built the initial port.
+
+---
+
+## Project overview
+
+`kprl` is a Python port of [RLdev](https://gitlab.com/haeleth/rldev), an OCaml toolchain
+for RealLive visual novel game files. It covers three of the four original tools:
+`kprl` (archive + bytecode), `vaconv` (image formats), and `rlxml` (GAN animations).
+The one tool **not** ported is `rlc` (the Kepago compiler).
+
+All code lives in the `kprl/` package. Entry point is `kprl/__main__.py`.
+
+---
+
+## Repository layout
+
+```
+kprl/               Python package
+  __init__.py       Exports
+  __main__.py       CLI entry point (all subcommands)
+  archive.py        SEEN.TXT archive read/write
+  rlcmp.py          KPRL LZ77 compression/decompression
+  bytecode.py       Low-level bytecode utilities (KFN header, entry points, etc.)
+  kfn.py            Parser for reallive.kfn function definition files
+  disasm.py         Bytecode disassembler → .ke + .utf
+  assemble.py       .ke assembler → binary bytecode
+  g00.py            G00 image codec (formats 0/1/2)
+  pdt.py            PDT10/PDT11 image codec
+  rct.py            Majiro RCT true-colour codec
+  rc8.py            Majiro RC8 8-bit paletted codec
+  gan.py            GAN animation binary ↔ XML
+
+lib/
+  reallive.kfn      Function definition data file (required at runtime by kfn.py)
+
+tests/
+  test_kprl.py      66 tests (pytest)
+
+pyproject.toml      uv/hatchling project, requires Pillow ≥ 10.0
+TRANSLATION_GUIDE.md  End-user translation workflow documentation
+```
+
+---
+
+## reallive.kfn — runtime data file
+
+`lib/reallive.kfn` is a function definition database for the RealLive bytecode engine.
+It maps every opcode `(op_type, op_module, op_func)` to a name, parameter types, and
+flags. It is parsed at runtime by `kfn.py`.
+
+`kfn.find_kfn_path()` searches for it in this order:
+1. `$RLDEV/lib/reallive.kfn` (environment variable)
+2. `lib/reallive.kfn` relative to the package, walking up to 5 parent directories
+3. `reallive.kfn` in the current working directory
+
+With the project living at `pyrldev/`, option 2 resolves to `pyrldev/lib/reallive.kfn`,
+which is where we put the copy. **Do not remove it.**
+
+---
+
+## SEEN.TXT archive format
+
+- Fixed 80 000-byte index table: 10 000 entries × 8 bytes each (offset LE32, length LE32).
+- Slot number comes from the filename: `SEEN0042.TXT` → slot 42.
+- Empty slots: both offset and length are 0.
+- Sub-files are raw bytecode (possibly KPRL-compressed, see below).
+- The magic `"\x00Empty RealLive archive"` (23 bytes) marks an empty archive.
+
+Reference: `src/kprl/archiver.ml` in the original rldev repo.
+
+---
+
+## KPRL LZ77 compression
+
+Magic headers:
+- `KPRL` — compressed, compiler 10002 (most games)
+- `KP2K` — compressed, AVG2000
+- `KPRM` — compressed, compiler 110002 (Little Busters!)
+- `RDRL` / `RD2K` / `RDRM` — same but next 4 bytes are version number
+
+Decompression: `rlcmp.py::decompress()`. Simple LZ77 with 8-bit flag bytes (1 = literal,
+0 = back-reference). Back-references encode distance/length in 2 bytes.
+
+Reference: `src/common/rlcmp.ml`.
+
+---
+
+## Bytecode file header (KFN)
+
+Every sub-file inside SEEN.TXT is a bytecode file with this layout (header v2 / KPRL):
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0x00   | 4    | Magic (`KPRL` / `RDRL` / etc.) |
+| 0x04   | 4    | Compiler version (e.g. 10002) |
+| 0x08   | 4    | 0 (padding / header version indicator) |
+| 0x0c   | 4    | 0 |
+| 0x10   | 4    | 0 |
+| 0x14   | 4    | 0 |
+| 0x18   | 4    | Number of Z-code entry points |
+| 0x1c   | 4    | Number of kidoku (scene-tracking) line numbers |
+| 0x20   | 4    | Data offset (where bytecode starts) |
+| 0x24   | 4    | Uncompressed size |
+| 0x28   | 4    | Compressed size (0 if not compressed) |
+| 0x2c   | 4    | int_0x2c (purpose unclear, copied verbatim) |
+| 0x30   | 4×N  | Entry point array (N = value at 0x18) |
+| …      | 4×K  | Kidoku line numbers (K = value at 0x1c) |
+| …      | …    | Dramatis personae (character name list) |
+| …      | …    | rldev metadata |
+| data_offset | … | Raw bytecode |
+
+`bytecode.py` handles parsing/writing this header. `kfn.py` has nothing to do with the
+header — it only parses the `reallive.kfn` data file.
+
+---
+
+## Bytecode instruction encoding
+
+Instructions are variable-length. The general structure is:
+
+```
+<op_type:1> <op_module:1> <op_func:2 LE> <op_overload:1>  [arguments...]
+```
+
+- `op_type` is always `0x23` (`#`) for standard opcodes.
+- Arguments are either integers (LE32) or strings (length-prefixed, CP932 or UTF-8).
+- Special constructs (`\` + byte) handle text escapes.
+- Jump labels are absolute byte offsets from the start of the bytecode data section.
+
+The disassembler (`disasm.py`) emits `.ke` assembly. The assembler (`assemble.py`)
+reads `.ke` and produces binary.
+
+---
+
+## .ke assembly syntax
+
+```
+// File header comment generated by disassembler
+
+#entrypoint N       // marks entry point N
+#character 'Name'   // dramatis personae entry (goes into .utf or inline)
+
+@42                 // jump label (absolute offset in decimal)
+
+  op<type,mod,func,overload>(args)   // opcode
+  'text string'                       // text output
+  {- comment -}                       // ignored by assembler
+```
+
+Key assembler rules:
+- Strings use **single quotes**. Escape literal `'` as `\'`.
+- Label numbers are decimal byte offsets from the start of bytecode data.
+- `op<>` notation: `op<0x23,0x01,0x04,0>` etc. The assembler also accepts
+  named opcodes from reallive.kfn.
+- `#entrypoint` lines set the entry point table.
+
+---
+
+## Image formats — critical: all use BGR/BGRA internally
+
+**This is the most important thing to know about the image code.**
+
+The original `vaconv` tool (OCaml/C) uses `png_set_bgr()` when reading PNGs and
+`PNG_TRANSFORM_BGR` when writing them (see `src/vaconv/png-interface.c`). This means
+**every image format stores pixels in BGR or BGRA order** on disk, not RGB/RGBA.
+
+All decoders in this port swap B↔R after reading. All encoders swap B↔R before writing.
+The fix pattern is:
+```python
+# decode (after assembling PIL image from raw bytes)
+r, g, b = img.split()
+return Image.merge("RGB", (b, g, r))   # swap B and R
+
+# encode (before writing raw bytes)
+r, g, b = rgb.split()
+bgr = Image.merge("RGB", (b, g, r))   # swap B and R
+```
+
+### G00 (g00.py)
+
+Three sub-formats; first byte of file indicates which:
+
+| Byte | Format | Description |
+|------|--------|-------------|
+| 0    | fmt0   | Uncompressed BGR pixels |
+| 1    | fmt1   | Paletted (256 BGRA entries × 4 bytes each) |
+| 2    | fmt2   | BGRA, split into rectangular regions with per-region compression |
+
+**fmt0 layout:** `[0x00] [width LE16] [height LE16] [BGR pixels...]`
+
+**fmt1 layout:** `[0x01] [width LE16] [height LE16] [256×4 BGRA palette] [8-bit indices...]`
+- Palette entries are 4 bytes: B, G, R, A
+- Decode as `[r, g, b, a]` for PIL; encode as `[b, g, r, a]`
+
+**fmt2 layout:** complex — has a region table, then per-region LZSS-compressed BGRA tiles.
+The LZ77 variant in fmt2 uses 8-bit flag bytes like KPRL compression.
+
+Auto-format selection in `_choose_format()`:
+- ≤256 unique RGBA colors → fmt1
+- >256 colors, no alpha → fmt0
+- >256 colors, has alpha → fmt2
+
+**Gotcha:** Images with few colors (e.g., a solid red fill) auto-select fmt1 even if the
+original was fmt0. Pass `--format 0` explicitly when exact format matters for game
+compatibility.
+
+### PDT (pdt.py)
+
+Two variants. Both start with a 0x20-byte header:
+
+| Offset | Field |
+|--------|-------|
+| 0x00   | Magic (`PDT10` or `PDT11`) |
+| 0x0c   | Width (LE32) |
+| 0x10   | Height (LE32) |
+| 0x14   | Mask offset (LE32, PDT10 only) |
+| 0x1c   | Mask pointer (LE32) |
+
+**PDT10:** Uncompressed BGR pixels at 0x20, then an optional 8-bit alpha mask (run-length
+encoded) at `mask_offset`. Alpha mask uses 1 byte per pixel.
+
+**PDT11:** Paletted. Palette is at 0x20, **4 bytes per entry** (B, G, R, unused), 256
+entries = 0x400 bytes. Pixel data follows, 8-bit indices, RLE-compressed (format: if
+high bit set → `(byte & 0x7f) + 1` copies of next byte, else `byte + 1` literal bytes).
+
+**Previous bugs (now fixed):**
+- Width was read at 0x10, height at 0x14 — wrong. Actual: width at 0x0c, height at 0x10.
+- PDT11 palette stride was treated as 3 bytes per entry. It is **4** bytes per entry.
+- PDT11 pixels were not swapped BGR→RGB after decoding.
+
+### RCT (rct.py) — Majiro true-colour
+
+Header: magic `"CT32"` + 4-byte version + width LE32 + height LE32.
+Pixels: LZSS-compressed BGR. Back-reference table: 16 pixel-distances × 4 codes = 64
+entries (codes 0x80–0xbf). Within each group of 4: `code % 4` → 1/2/3/long pixels back.
+"Long" = read LE16 + 4.
+
+### RC8 (rc8.py) — Majiro 8-bit paletted
+
+Header: magic `"CT8 "` + 4-byte version + width LE32 + height LE32 + 0x400-byte BGR palette.
+Pixels: LZSS-compressed 8-bit indices. Same back-reference table style as RCT but 16
+distances × 7 codes = 112 entries (0x80–0xef). `code % 7` → 3/4/5/6/7/8/long pixels back.
+"Long" = read LE16 + 9.
+
+Palette is stored as BGR (3 bytes/entry × 256 = 768 bytes). Decode swaps to RGB.
+
+### GAN (gan.py)
+
+GAN files describe sprite animation sequences. Binary format:
+
+```
+[magic "GAN "][version LE32][n_sets LE32]
+per set: [bitmap_name_len LE16][bitmap_name][n_frames_count LE32]
+per frame: [tag LE32][value LE32]  (tags < 999999)
+           [999999 LE32]            (terminator — NO value byte follows)
+```
+
+`gan.py` converts this to/from XML (`<vas_gan>` root element), matching the original
+`rlxml` tool's output exactly.
+
+**Critical detail:** The frame terminator tag `999999` has **no value** following it.
+Every other tag has a value. This is easy to get wrong.
+
+---
+
+## CLI subcommands
+
+All in `kprl/__main__.py`:
+
+| Subcommand | Function | Description |
+|------------|----------|-------------|
+| `break` | `cmd_break` | Extract sub-files from SEEN.TXT |
+| `add` | `cmd_add` | Insert/replace sub-files in SEEN.TXT |
+| `remove` | `cmd_remove` | Remove sub-files by slot number |
+| `list` | `cmd_list` | Print archive contents |
+| `disassemble` | `cmd_disassemble` | Binary bytecode → .ke + .utf |
+| `assemble` | `cmd_assemble` | .ke → binary bytecode |
+| `extract` | `cmd_extract` | Decompress a KPRL file (no disassembly) |
+| `pack` | `cmd_pack` | LZ77-compress a raw bytecode file |
+| `img2png` | `cmd_img2png` | G00/PDT/RCT/RC8 → PNG |
+| `png2img` | `cmd_png2img` | PNG → G00/PDT/RCT/RC8 |
+| `ganxml` | `cmd_ganxml` | GAN ↔ XML (direction from file extension) |
+
+When `--output-dir` / `-o` is specified, the directory is created with
+`mkdir(parents=True, exist_ok=True)` before writing. This was a bug in early versions
+(directory not created) — it's fixed.
+
+---
+
+## Testing
+
+```bash
+uv run pytest tests/ -v
+```
+
+66 tests total. Test classes:
+- `TestArchive` — SEEN.TXT round-trip
+- `TestCompression` — LZ77 compress/decompress
+- `TestBytecode` — header parse/write
+- `TestDisassembler` / `TestAssembler` — bytecode round-trips
+- `TestGAN` — GAN binary ↔ XML
+- `TestG00` / `TestPDT` / `TestRCT` / `TestRC8` — image codec round-trips
+
+Real game files tested against: Canary (Visual Art's / Key).
+- 33/33 SEEN.TXT scripts: disassemble → reassemble → byte-identical ✓
+- 269/269 G00 images: decode → PNG → correct colors ✓
+- Both PDT files: decode → PNG → re-encode → decode → pixel-identical ✓
+- GAN files: binary → XML → binary → byte-identical ✓
+
+---
+
+## Known limitations and gotchas
+
+1. **LZSS encoders are O(n²).** Large images (640×480) take several minutes to
+   compress. For batch encoding, this is impractical without a C extension or
+   algorithmic improvement (suffix array, etc.).
+
+2. **PDT11 encoding is not implemented.** `write_pdt` always produces PDT10.
+   PDT11 decoding works.
+
+3. **RC8 write has a guard** in the palette construction:
+   `if i * 3 + 2 < len(pal_bytes)` — verify this handles exactly 256 entries.
+
+4. **G00 format auto-detection** may choose a different sub-format than the
+   original file used (see G00 section above). Use `--format N` to force.
+
+5. **`assemble.py` is a reassembler, not a compiler.** It can only reconstruct
+   bytecode from `.ke` output produced by the disassembler. It does not implement
+   the full Kepago language (expressions, control flow from source, etc.). That
+   requires porting `rlc`.
+
+6. **Character encoding:** the disassembler reads strings as raw bytes and writes
+   them with a `# -*- coding: ... -*-` comment. The assembler reads back with the
+   declared encoding. The default is UTF-8, but original files are CP932.
+
+---
+
+## What is not ported: `rlc`
+
+`rlc` is the Kepago-to-bytecode compiler. It takes human-written `.ke` source files
+(not disassembled output) and compiles them to bytecode. The source is in
+`src/rlc/` of the original rldev repo and is roughly 20+ OCaml source files.
+
+Porting it would require implementing:
+- A full Kepago lexer/parser (`keAstParser.mly`, `keULexer.ml`)
+- Expression compiler (`expr.ml`, `codegen.ml`)
+- Control flow / goto resolution (`goto.ml`, `select.ml`)
+- Function/intrinsic call codegen (`funcAsm.ml`, `intrinsic.ml`)
+- Ini-file config parsing (`iniLexer.mll`, `iniParser.mly`)
+- Memory layout (variables, strings: `memory.ml`, `variables.ml`)
+
+It is a significant undertaking. The `assemble.py` reassembler is sufficient for
+translation work (edit existing scripts) but not for writing new scenarios from scratch.
